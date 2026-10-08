@@ -1,0 +1,9 @@
+{
+  "slug": "pvz",
+  "name": "植物大战僵尸 · 白天1-5",
+  "entry": "src/main.js",
+  "scopes": ["kv", "webview", "kv.shared"],
+  "surface": "webview",
+  "placement": "single",
+  "triggers": []
+}
