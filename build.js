@@ -1,17 +1,49 @@
 // 从 index.html 提取 html/css/js，生成 nodeloc 小程序入口 src/main.js
 const fs = require("fs");
 const path = require("path");
+const sharp = require("sharp");
 
+(async () => {
 const html = fs.readFileSync(path.join(__dirname, "index.html"), "utf8");
 
-const css = html.match(/<style>([\s\S]*?)<\/style>/)[1];
-const js = html.match(/<script>([\s\S]*?)<\/script>/)[1];
+let css = html.match(/<style>([\s\S]*?)<\/style>/)[1];
+const jsRaw = html.match(/<script>([\s\S]*?)<\/script>/)[1];
 const body = html.match(/<body>([\s\S]*?)<\/body>/)[1]
   .replace(/<script>[\s\S]*?<\/script>/, "")
   .trim();
 
-// 转义反引号和 ${ （虽然源码里没有，保险起见）
-const esc = (s) => s.replace(/\\/g, "\\\\").replace(/`/g, "\\`").replace(/\$\{/g, "\\${");
+// NodeLoc 限制打包后代码 ≤ 512KB，图片须缩放并转 WebP 后再内嵌
+async function assetDataUrl(relPath, maxW, maxH, quality){
+  const full = path.join(__dirname, relPath);
+  if(!fs.existsSync(full)) return null;
+  const buf = await sharp(full)
+    .resize(maxW, maxH, { fit: "inside", withoutEnlargement: true })
+    .webp({ quality, alphaQuality: 80, effort: 6 })
+    .toBuffer();
+  return "data:image/webp;base64," + buf.toString("base64");
+}
+const assetMap = {
+  hero: await assetDataUrl("assets/hero-bg.jpg", 1280, 720, 45),
+  nightLawn: await assetDataUrl("assets/night-lawn.jpg", 704, 704, 48),
+  dayLawn: await assetDataUrl("assets/day-lawn.jpg", 704, 704, 42),
+  house: await assetDataUrl("assets/house-side.png", 240, 320, 70),
+  mower: await assetDataUrl("assets/mower-cart.png", 128, 128, 75)
+};
+// 首页背景由页面脚本经 --hero-bg 注入，CSS 回退值不再内嵌第二份
+if(assetMap.hero){
+  css = css.replace(/url\("assets\/hero-bg\.jpg"\)/g, "none");
+}
+const assetInject = "window.__ASSETS__=" + JSON.stringify({
+  hero: assetMap.hero || "assets/hero-bg.jpg",
+  nightLawn: assetMap.nightLawn || "assets/night-lawn.jpg",
+  dayLawn: assetMap.dayLawn || "assets/day-lawn.jpg",
+  house: assetMap.house || "assets/house-side.png",
+  mower: assetMap.mower || "assets/mower-cart.png"
+}) + ";\n";
+const js = assetInject + jsRaw;
+
+const fontImport = '@import url("https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&family=Noto+Sans+SC:wght@400;500;700&family=ZCOOL+QingKe+HuangYou&display=swap");\n';
+css = fontImport + css;
 
 const out = `// 此文件由 build.js 从 index.html 自动生成。修改游戏请改 index.html 后重新运行 node build.js
 const GAME_HTML = ${JSON.stringify(body)};
@@ -70,8 +102,8 @@ export async function render(ctx, api) {
   } catch(e) {}
 
   const children = [
-    { type: "text", value: "植物大战僵尸 · 白天 1-5", size: "xl", weight: "bold" },
-    { type: "text", value: "终极挑战：3 面旗 · 5 行 · 普通僵尸、路障、撑杆跳、铁桶齐上阵", size: "medium" },
+    { type: "text", value: "植物大战僵尸 · 庭院防线", size: "xl", weight: "bold" },
+    { type: "text", value: "白天 1-10 · 黑夜 2-10 · 难度/无尽/每周挑战", size: "medium" },
     { type: "text", value: "🏆 通关排行榜", size: "large", weight: "bold" }
   ];
   if (leaderboard.length === 0) {
@@ -161,19 +193,20 @@ export async function onMessage(ctx, api) {
   if (ctx.method !== "finish") {
     return { blocks: null, state: null, effects: [] };
   }
-  const { seed, actions, result, level, mode, collectedSun } = ctx.params || {};
-  const kills = replay(seed, actions);
+  const { seed, actions, result, level, mode, collectedSun, difficulty, world } = ctx.params || {};
+  const kills = replay(seed, actions, mode);
   const effects = [];
 
   // 个人最高击杀
   let best = 0;
   try { best = (await api.kv.get("best")) ?? 0; } catch(e) {}
-  if (result === "win" && kills > best) {
+  if ((result === "win" || mode === "endless") && kills > best) {
     effects.push({ type: "kv.set", key: "best", value: kills });
   }
 
-  // 通关排行榜：只有通关才记入（现在只有第五关）
-  if (result === "win" && level === 0 && ctx.user) {
+  // 通关排行榜：通关白天 1-10 或黑夜 2-10（普通/困难）才记入
+  const isClearFinal = level === 9 && (world === "day" || world === "night" || world == null);
+  if (result === "win" && isClearFinal && mode === "normal" && difficulty !== "easy" && ctx.user) {
     try {
       let clearCount = 0;
       try { clearCount = parseInt((await api.kv.get("clears")) ?? 0) || 0; } catch(e) {}
@@ -216,16 +249,19 @@ export async function onMessage(ctx, api) {
 
 // 简化回放：用相同种子校验操作序列的合法性，统计击杀数。
 // 真实场景应完整重放游戏模拟逻辑；这里校验种子有效且操作结构合法。
-function replay(seed, actions) {
+function replay(seed, actions, mode) {
   if (!Number.isInteger(seed) || !Array.isArray(actions)) return 0;
   let kills = 0;
   for (const a of actions) {
     if (a && a.e === "kill") kills++;
   }
-  // 击杀数上限：第三关 20 波的理论上限
-  return Math.min(kills, 200);
+  // 击杀数上限：冒险模式 / 无尽模式
+  return Math.min(kills, mode === "endless" ? 5000 : 500);
 }
 `;
 
 fs.writeFileSync(path.join(__dirname, "src", "main.js"), out, "utf8");
-console.log("src/main.js generated, " + out.length + " bytes");
+const size = Buffer.byteLength(out, "utf8");
+for(const [k, v] of Object.entries(assetMap)) if(v) console.log("  " + k + ": " + Math.round(v.length/1024) + " KB");
+console.log("src/main.js generated, " + Math.round(size/1024) + " KB" + (size > 512*1024 ? "（超过 NodeLoc 512KB 上限！）" : ""));
+})();

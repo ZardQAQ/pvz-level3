@@ -1,6 +1,6 @@
 {
   "slug": "pvz",
-  "name": "植物大战僵尸 · 白天1-5",
+  "name": "植物大战僵尸 · 白天/黑夜",
   "entry": "src/main.js",
   "scopes": ["kv", "webview", "kv.shared"],
   "surface": "webview",
